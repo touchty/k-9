@@ -1,6 +1,7 @@
 package com.fsck.k9.message;
 
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -11,11 +12,11 @@ import android.content.Intent;
 import android.support.annotation.NonNull;
 import android.support.annotation.Nullable;
 import android.support.annotation.VisibleForTesting;
-import timber.log.Timber;
 
 import com.fsck.k9.Globals;
-import com.fsck.k9.K9;
 import com.fsck.k9.activity.compose.ComposeCryptoStatus;
+import com.fsck.k9.autocrypt.AutocryptOperations;
+import com.fsck.k9.mail.Address;
 import com.fsck.k9.mail.Body;
 import com.fsck.k9.mail.BodyPart;
 import com.fsck.k9.mail.BoundaryGenerator;
@@ -36,10 +37,15 @@ import org.apache.james.mime4j.util.MimeUtil;
 import org.openintents.openpgp.OpenPgpError;
 import org.openintents.openpgp.util.OpenPgpApi;
 import org.openintents.openpgp.util.OpenPgpApi.OpenPgpDataSource;
+import timber.log.Timber;
 
 
 public class PgpMessageBuilder extends MessageBuilder {
     private static final int REQUEST_USER_INTERACTION = 1;
+
+
+    private final AutocryptOperations autocryptOperations;
+
 
     private OpenPgpApi openPgpApi;
 
@@ -51,12 +57,16 @@ public class PgpMessageBuilder extends MessageBuilder {
         Context context = Globals.getContext();
         MessageIdGenerator messageIdGenerator = MessageIdGenerator.getInstance();
         BoundaryGenerator boundaryGenerator = BoundaryGenerator.getInstance();
-        return new PgpMessageBuilder(context, messageIdGenerator, boundaryGenerator);
+        AutocryptOperations autocryptOperations = AutocryptOperations.getInstance();
+        return new PgpMessageBuilder(context, messageIdGenerator, boundaryGenerator, autocryptOperations);
     }
 
     @VisibleForTesting
-    PgpMessageBuilder(Context context, MessageIdGenerator messageIdGenerator, BoundaryGenerator boundaryGenerator) {
+    PgpMessageBuilder(Context context, MessageIdGenerator messageIdGenerator, BoundaryGenerator boundaryGenerator,
+            AutocryptOperations autocryptOperations) {
         super(context, messageIdGenerator, boundaryGenerator);
+
+        this.autocryptOperations = autocryptOperations;
     }
 
 
@@ -72,9 +82,6 @@ public class PgpMessageBuilder extends MessageBuilder {
         if (cryptoStatus == null) {
             throw new IllegalStateException("PgpMessageBuilder must have cryptoStatus set before building!");
         }
-        if (cryptoStatus.isCryptoDisabled()) {
-            throw new AssertionError("PgpMessageBuilder must not be used if crypto is disabled!");
-        }
 
         try {
             if (!cryptoStatus.isProviderStateOk()) {
@@ -85,6 +92,16 @@ public class PgpMessageBuilder extends MessageBuilder {
         } catch (MessagingException me) {
             queueMessageBuildException(me);
             return;
+        }
+
+        Long signingKeyId = cryptoStatus.getOpenPgpKeyId();
+        if (signingKeyId != null) {
+            Address address = currentProcessedMimeMessage.getFrom()[0];
+            byte[] keyData = getKeyMaterialFromApi(openPgpApi, signingKeyId, address.getAddress());
+            if (keyData != null) {
+                autocryptOperations.addAutocryptHeaderToMessage(
+                        currentProcessedMimeMessage, keyData, address.getAddress(), false);
+            }
         }
 
         startOrContinueBuildMessage(null);
@@ -105,6 +122,7 @@ public class PgpMessageBuilder extends MessageBuilder {
             boolean isPgpInlineMode = cryptoStatus.isPgpInlineModeEnabled();
 
             if (!shouldSign && !shouldEncrypt) {
+                queueMessageBuildSuccess(currentProcessedMimeMessage);
                 return;
             }
 
@@ -135,6 +153,8 @@ public class PgpMessageBuilder extends MessageBuilder {
     private Intent buildOpenPgpApiIntent(boolean shouldSign, boolean shouldEncrypt, boolean isPgpInlineMode)
             throws MessagingException {
         Intent pgpApiIntent;
+
+        Long openPgpKeyId = cryptoStatus.getOpenPgpKeyId();
         if (shouldEncrypt) {
             if (!shouldSign) {
                 throw new IllegalStateException("encrypt-only is not supported at this point and should never happen!");
@@ -142,9 +162,9 @@ public class PgpMessageBuilder extends MessageBuilder {
             // pgpApiIntent = new Intent(shouldSign ? OpenPgpApi.ACTION_SIGN_AND_ENCRYPT : OpenPgpApi.ACTION_ENCRYPT);
             pgpApiIntent = new Intent(OpenPgpApi.ACTION_SIGN_AND_ENCRYPT);
 
-            long[] encryptKeyIds = cryptoStatus.getEncryptKeyIds();
-            if (encryptKeyIds != null) {
-                pgpApiIntent.putExtra(OpenPgpApi.EXTRA_KEY_IDS, encryptKeyIds);
+            if (openPgpKeyId != null) {
+                long[] selfEncryptIds = { openPgpKeyId };
+                pgpApiIntent.putExtra(OpenPgpApi.EXTRA_KEY_IDS, selfEncryptIds);
             }
 
             if(!isDraft()) {
@@ -154,14 +174,14 @@ public class PgpMessageBuilder extends MessageBuilder {
                     throw new MessagingException("encryption is enabled, but no recipient specified!");
                 }
                 pgpApiIntent.putExtra(OpenPgpApi.EXTRA_USER_IDS, encryptRecipientAddresses);
-                pgpApiIntent.putExtra(OpenPgpApi.EXTRA_ENCRYPT_OPPORTUNISTIC, cryptoStatus.isEncryptionOpportunistic());
+                pgpApiIntent.putExtra(OpenPgpApi.EXTRA_OPPORTUNISTIC_ENCRYPTION, cryptoStatus.isEncryptionOpportunistic());
             }
         } else {
             pgpApiIntent = new Intent(isPgpInlineMode ? OpenPgpApi.ACTION_SIGN : OpenPgpApi.ACTION_DETACHED_SIGN);
         }
 
         if (shouldSign) {
-            pgpApiIntent.putExtra(OpenPgpApi.EXTRA_SIGN_KEY_ID, cryptoStatus.getSigningKeyId());
+            pgpApiIntent.putExtra(OpenPgpApi.EXTRA_SIGN_KEY_ID, openPgpKeyId);
         }
 
         pgpApiIntent.putExtra(OpenPgpApi.EXTRA_REQUEST_ASCII_ARMOR, true);
@@ -333,5 +353,22 @@ public class PgpMessageBuilder extends MessageBuilder {
 
     public void setCryptoStatus(ComposeCryptoStatus cryptoStatus) {
         this.cryptoStatus = cryptoStatus;
+    }
+
+    @VisibleForTesting
+    byte[] getKeyMaterialFromApi(OpenPgpApi openPgpApi, long keyId, String minimizeForUserId) {
+        Intent retreiveKeyIntent = new Intent(OpenPgpApi.ACTION_GET_KEY);
+        retreiveKeyIntent.putExtra(OpenPgpApi.EXTRA_KEY_ID, keyId);
+        retreiveKeyIntent.putExtra(OpenPgpApi.EXTRA_MINIMIZE, true);
+        retreiveKeyIntent.putExtra(OpenPgpApi.EXTRA_MINIMIZE_USER_ID, minimizeForUserId);
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        Intent result = openPgpApi.executeApi(retreiveKeyIntent, (InputStream) null, baos);
+
+        if (result.getIntExtra(OpenPgpApi.RESULT_CODE, OpenPgpApi.RESULT_CODE_ERROR) ==
+                OpenPgpApi.RESULT_CODE_SUCCESS) {
+            return baos.toByteArray();
+        } else{
+            return null;
+        }
     }
 }
