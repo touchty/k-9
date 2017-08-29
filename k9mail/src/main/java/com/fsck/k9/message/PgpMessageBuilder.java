@@ -132,6 +132,10 @@ public class PgpMessageBuilder extends MessageBuilder {
                 throw new MessagingException("Attachments are not supported in PGP/INLINE format!");
             }
 
+            if (shouldEncrypt && !cryptoStatus.hasRecipients()) {
+                throw new MessagingException("Must have recipients to build message!");
+            }
+
             if (pgpApiIntent == null) {
                 pgpApiIntent = buildOpenPgpApiIntent(shouldSign, shouldEncrypt, isPgpInlineMode);
             }
@@ -150,8 +154,7 @@ public class PgpMessageBuilder extends MessageBuilder {
     }
 
     @NonNull
-    private Intent buildOpenPgpApiIntent(boolean shouldSign, boolean shouldEncrypt, boolean isPgpInlineMode)
-            throws MessagingException {
+    private Intent buildOpenPgpApiIntent(boolean shouldSign, boolean shouldEncrypt, boolean isPgpInlineMode) {
         Intent pgpApiIntent;
 
         Long openPgpKeyId = cryptoStatus.getOpenPgpKeyId();
@@ -168,13 +171,8 @@ public class PgpMessageBuilder extends MessageBuilder {
             }
 
             if(!isDraft()) {
-                String[] encryptRecipientAddresses = cryptoStatus.getRecipientAddresses();
-                boolean hasRecipientAddresses = encryptRecipientAddresses != null && encryptRecipientAddresses.length > 0;
-                if (!hasRecipientAddresses) {
-                    throw new MessagingException("encryption is enabled, but no recipient specified!");
-                }
-                pgpApiIntent.putExtra(OpenPgpApi.EXTRA_USER_IDS, encryptRecipientAddresses);
-                pgpApiIntent.putExtra(OpenPgpApi.EXTRA_OPPORTUNISTIC_ENCRYPTION, cryptoStatus.isEncryptionOpportunistic());
+                pgpApiIntent.putExtra(OpenPgpApi.EXTRA_USER_IDS, cryptoStatus.getRecipientAddresses());
+//                pgpApiIntent.putExtra(OpenPgpApi.EXTRA_ENCRYPT_OPPORTUNISTIC, cryptoStatus.isEncryptionOpportunistic());
             }
         } else {
             pgpApiIntent = new Intent(isPgpInlineMode ? OpenPgpApi.ACTION_SIGN : OpenPgpApi.ACTION_DETACHED_SIGN);
@@ -232,6 +230,7 @@ public class PgpMessageBuilder extends MessageBuilder {
                 if (error == null) {
                     throw new MessagingException("internal openpgp api error");
                 }
+                /*
                 boolean isOpportunisticError = error.getErrorId() == OpenPgpError.OPPORTUNISTIC_MISSING_KEYS;
                 if (isOpportunisticError) {
                     if (!cryptoStatus.isEncryptionOpportunistic()) {
@@ -241,6 +240,7 @@ public class PgpMessageBuilder extends MessageBuilder {
                     Timber.d("Skipping encryption due to opportunistic mode");
                     return null;
                 }
+                */
                 throw new MessagingException(error.getMessage());
         }
 
